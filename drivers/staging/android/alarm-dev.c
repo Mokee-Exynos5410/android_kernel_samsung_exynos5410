@@ -44,9 +44,13 @@ module_param_named(debug_mask, debug_mask, int, S_IRUGO | S_IWUSR | S_IWGRP);
 	ANDROID_ALARM_RTC_WAKEUP_MASK | \
 	ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP_MASK)
 
+/* support old usespace code */
+#define ANDROID_ALARM_SET_OLD               _IOW('a', 2, time_t) /* set alarm */
+#define ANDROID_ALARM_SET_AND_WAIT_OLD      _IOW('a', 3, time_t)
+
 static int alarm_opened;
 static DEFINE_SPINLOCK(alarm_slock);
-static struct wakeup_source alarm_wake_lock;
+static struct wake_lock alarm_wake_lock;
 static DECLARE_WAIT_QUEUE_HEAD(alarm_wait_queue);
 static uint32_t alarm_pending;
 static uint32_t alarm_enabled;
@@ -142,11 +146,20 @@ static long alarm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (alarm_pending) {
 			alarm_pending &= ~alarm_type_mask;
 			if (!alarm_pending && !wait_pending)
-				__pm_relax(&alarm_wake_lock);
+				wake_unlock(&alarm_wake_lock);
 		}
 		alarm_enabled &= ~alarm_type_mask;
 		spin_unlock_irqrestore(&alarm_slock, flags);
 		break;
+
+	case ANDROID_ALARM_SET_OLD:
+	case ANDROID_ALARM_SET_AND_WAIT_OLD:
+		if (get_user(new_alarm_time.tv_sec, (int __user *)arg)) {
+			rv = -EFAULT;
+			goto err1;
+		}
+		new_alarm_time.tv_nsec = 0;
+		goto from_old_alarm_set;
 
 	case ANDROID_ALARM_SET_AND_WAIT(0):
 	case ANDROID_ALARM_SET(0):
@@ -155,6 +168,7 @@ static long alarm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			rv = -EFAULT;
 			goto err1;
 		}
+from_old_alarm_set:
 		spin_lock_irqsave(&alarm_slock, flags);
 		pr_alarm(IO, "alarm %d set %ld.%09ld\n", alarm_type,
 			new_alarm_time.tv_sec, new_alarm_time.tv_nsec);
@@ -162,15 +176,15 @@ static long alarm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		devalarm_start(&alarms[alarm_type],
 			timespec_to_ktime(new_alarm_time));
 		spin_unlock_irqrestore(&alarm_slock, flags);
-		if (ANDROID_ALARM_BASE_CMD(cmd) !=
-						ANDROID_ALARM_SET_AND_WAIT(0)
+		if (ANDROID_ALARM_BASE_CMD(cmd) != ANDROID_ALARM_SET_AND_WAIT(0)
+		    && cmd != ANDROID_ALARM_SET_AND_WAIT_OLD)
 			break;
 		/* fall though */
 	case ANDROID_ALARM_WAIT:
 		spin_lock_irqsave(&alarm_slock, flags);
 		pr_alarm(IO, "alarm wait\n");
 		if (!alarm_pending && wait_pending) {
-			__pm_relax(&alarm_wake_lock);
+			wake_unlock(&alarm_wake_lock);
 			wait_pending = 0;
 		}
 		spin_unlock_irqrestore(&alarm_slock, flags);
@@ -271,7 +285,7 @@ static int alarm_release(struct inode *inode, struct file *file)
 			if (alarm_pending)
 				pr_alarm(INFO, "alarm_release: clear "
 					"pending alarms %x\n", alarm_pending);
-			__pm_relax(&alarm_wake_lock);
+			wake_unlock(&alarm_wake_lock);
 			wait_pending = 0;
 			alarm_pending = 0;
 		}
@@ -289,7 +303,7 @@ static void devalarm_triggered(struct devalarm *alarm)
 	pr_alarm(INT, "devalarm_triggered type %d\n", alarm->type);
 	spin_lock_irqsave(&alarm_slock, flags);
 	if (alarm_enabled & alarm_type_mask) {
-		__pm_wakeup_event(&alarm_wake_lock, 5000); /* 5secs */
+		wake_lock_timeout(&alarm_wake_lock, 5 * HZ);
 		alarm_enabled &= ~alarm_type_mask;
 		alarm_pending |= alarm_type_mask;
 		wake_up(&alarm_wait_queue);
@@ -355,14 +369,15 @@ static int __init alarm_dev_init(void)
 			alarms[i].u.hrt.function = devalarm_hrthandler;
 	}
 
-	wakeup_source_init(&alarm_wake_lock, "alarm");
+	wake_lock_init(&alarm_wake_lock, WAKE_LOCK_SUSPEND, "alarm");
+
 	return 0;
 }
 
 static void  __exit alarm_dev_exit(void)
 {
 	misc_deregister(&alarm_device);
-	wakeup_source_trash(&alarm_wake_lock);
+	wake_lock_destroy(&alarm_wake_lock);
 }
 
 module_init(alarm_dev_init);
